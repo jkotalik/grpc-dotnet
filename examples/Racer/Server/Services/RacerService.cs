@@ -29,27 +29,36 @@ namespace Server
     {
         public override async Task ReadySetGo(IAsyncStreamReader<RaceMessage> requestStream, IServerStreamWriter<RaceMessage> responseStream, ServerCallContext context)
         {
-            var raceDuration = TimeSpan.Parse(context.RequestHeaders.Single(h => h.Key == "race-duration").Value);
-
-            // Read incoming messages in a background task
-            RaceMessage? lastMessageReceived = null;
-            var readTask = Task.Run(async () =>
+            try
             {
-                await foreach (var message in requestStream.ReadAllAsync())
+                var raceDuration = TimeSpan.Parse(context.RequestHeaders.Single(h => h.Key == "race-duration").Value);
+                System.Console.WriteLine($"Start request");
+                // Read incoming messages in a background task
+                RaceMessage? lastMessageReceived = null;
+                var sw = Stopwatch.StartNew();
+
+                var readTask = Task.Run(async () =>
                 {
-                    lastMessageReceived = message;
+                    await foreach (var message in requestStream.ReadAllAsync())
+                    {
+                        lastMessageReceived = message;
+                    }
+                });
+
+                // Write outgoing messages until timer is complete
+                var sent = 0;
+                while (sw.Elapsed < raceDuration)
+                {
+                    await responseStream.WriteAsync(new RaceMessage { Count = ++sent });
                 }
-            });
 
-            // Write outgoing messages until timer is complete
-            var sw = Stopwatch.StartNew();
-            var sent = 0;
-            while (sw.Elapsed < raceDuration)
-            {
-                await responseStream.WriteAsync(new RaceMessage { Count = ++sent });
+                await readTask;
+                System.Console.WriteLine($"End request");
             }
-
-            await readTask;
+            catch (Exception ex)
+            {
+                System.Console.WriteLine(ex.Message);
+            }
         }
     }
 }
