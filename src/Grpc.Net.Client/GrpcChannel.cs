@@ -21,10 +21,10 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
-using System.Threading;
 using Grpc.Core;
 using Grpc.Net.Client.Internal;
 using Grpc.Net.Compression;
+using Grpc.Shared;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -99,7 +99,18 @@ namespace Grpc.Net.Client
         {
             // HttpMessageInvoker should always dispose handler if Disposed is called on it.
             // Decision to dispose invoker is controlled by _shouldDisposeHttpClient.
-            var httpInvoker = new HttpMessageInvoker(handler ?? new HttpClientHandler(), disposeHandler: true);
+            if (handler == null)
+            {
+                handler = HttpHandlerFactory.CreatePrimaryHandler();
+            }
+
+#if NET5_0
+            handler = HttpHandlerFactory.EnsureTelemetryHandler(handler);
+#endif
+
+            // Use HttpMessageInvoker instead of HttpClient because it is faster
+            // and we don't need client's features.
+            var httpInvoker = new HttpMessageInvoker(handler, disposeHandler: true);
 
             return httpInvoker;
         }

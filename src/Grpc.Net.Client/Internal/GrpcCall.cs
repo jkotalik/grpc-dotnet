@@ -30,12 +30,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Grpc.Net.Client.Internal
 {
-    internal partial class GrpcCall<TRequest, TResponse> : IDisposable
+    internal sealed partial class GrpcCall<TRequest, TResponse> : GrpcCall, IDisposable
         where TRequest : class
         where TResponse : class
     {
-        // Getting logger name from generic type is slow
-        private const string LoggerName = "Grpc.Net.Client.Internal.GrpcCall";
+        private const string ErrorStartingCallMessage = "Error starting gRPC call.";
 
         private readonly CancellationTokenSource _callCts;
         private readonly TaskCompletionSource<Status> _callTcs;
@@ -45,16 +44,10 @@ namespace Grpc.Net.Client.Internal
         private Task<HttpResponseMessage>? _httpResponseTask;
         private Task<Metadata>? _responseHeadersTask;
         private Timer? _deadlineTimer;
-        private Metadata? _trailers;
         private CancellationTokenRegistration? _ctsRegistration;
 
         public bool Disposed { get; private set; }
-        public bool ResponseFinished { get; private set; }
-        public HttpResponseMessage? HttpResponse { get; private set; }
-        public CallOptions Options { get; }
         public Method<TRequest, TResponse> Method { get; }
-        public GrpcChannel Channel { get; }
-        public ILogger Logger { get; }
 
         // These are set depending on the type of gRPC call
         private TaskCompletionSource<TResponse>? _responseTcs;
@@ -62,6 +55,7 @@ namespace Grpc.Net.Client.Internal
         public HttpContentClientStreamReader<TRequest, TResponse>? ClientStreamReader { get; private set; }
 
         public GrpcCall(Method<TRequest, TResponse> method, GrpcMethodInfo grpcMethodInfo, CallOptions options, GrpcChannel channel)
+            : base(options, channel)
         {
             // Validate deadline before creating any objects that require cleanup
             ValidateDeadline(options.Deadline);
@@ -71,9 +65,6 @@ namespace Grpc.Net.Client.Internal
             _callTcs = new TaskCompletionSource<Status>();
             Method = method;
             _grpcMethodInfo = grpcMethodInfo;
-            Options = options;
-            Channel = channel;
-            Logger = channel.LoggerFactory.CreateLogger(LoggerName);
             _deadline = options.Deadline ?? DateTime.MaxValue;
 
             Channel.RegisterActiveCall(this);
@@ -93,6 +84,9 @@ namespace Grpc.Net.Client.Internal
         {
             get { return _callCts.Token; }
         }
+
+        public override Type RequestType => typeof(TRequest);
+        public override Type ResponseType => typeof(TResponse);
 
         public void StartUnary(TRequest request)
         {
@@ -252,9 +246,8 @@ namespace Grpc.Net.Client.Internal
 
                 return GrpcProtocolHelpers.BuildMetadata(httpResponse.Headers);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ResolveException(ErrorStartingCallMessage, ex, out _, out var resolvedException))
             {
-                ResolveException(ex, out _, out var resolvedException);
                 throw resolvedException;
             }
         }
@@ -288,7 +281,7 @@ namespace Grpc.Net.Client.Internal
             {
                 // Trailers are in the header because there is no message.
                 // Note that some default headers will end up in the trailers (e.g. Date, Server).
-                _trailers = GrpcProtocolHelpers.BuildMetadata(httpResponse.Headers);
+                Trailers = GrpcProtocolHelpers.BuildMetadata(httpResponse.Headers);
                 return status;
             }
 
@@ -364,33 +357,21 @@ namespace Grpc.Net.Client.Internal
             }
         }
 
-        private bool TryGetTrailers([NotNullWhen(true)] out Metadata? trailers)
-        {
-            if (_trailers == null)
-            {
-                // Trailers are read from the end of the request.
-                // If the request isn't finished then we can't get the trailers.
-                if (!ResponseFinished)
-                {
-                    trailers = null;
-                    return false;
-                }
-
-                Debug.Assert(HttpResponse != null);
-                _trailers = GrpcProtocolHelpers.BuildMetadata(HttpResponse.TrailingHeaders);
-            }
-
-            trailers = _trailers;
-            return true;
-        }
-
         private void SetMessageContent(TRequest request, HttpRequestMessage message)
         {
+            RequestGrpcEncoding = GrpcProtocolHelpers.GetRequestEncoding(message.Headers);
             message.Content = new PushUnaryContent<TRequest, TResponse>(
                 request,
                 this,
-                GrpcProtocolHelpers.GetRequestEncoding(message.Headers),
                 GrpcProtocolConstants.GrpcContentTypeHeaderValue);
+        }
+
+        public void CancelCallFromCancellationToken()
+        {
+            using (StartScope())
+            {
+                CancelCall(new Status(StatusCode.Cancelled, "Call canceled by the client."));
+            }
         }
 
         private void CancelCall(Status status)
@@ -432,12 +413,6 @@ namespace Grpc.Net.Client.Internal
             }
 
             return null;
-        }
-
-        internal RpcException CreateRpcException(Status status)
-        {
-            TryGetTrailers(out var trailers);
-            return new RpcException(status, trailers ?? Metadata.Empty);
         }
 
         private async Task RunCall(HttpRequestMessage request, TimeSpan? timeout)
@@ -488,7 +463,6 @@ namespace Grpc.Net.Client.Internal
                             if (status.Value.StatusCode != StatusCode.OK)
                             {
                                 finished = FinishCall(request, diagnosticSourceEnabled, activity, status.Value);
-                                SetFailedResult(status.Value);
                             }
                             else
                             {
@@ -501,10 +475,15 @@ namespace Grpc.Net.Client.Internal
                                 status = new Status(StatusCode.Internal, "Failed to deserialize response message.");
 
                                 finished = FinishCall(request, diagnosticSourceEnabled, activity, status.Value);
-                                SetFailedResult(status.Value);
                             }
 
                             FinishResponseAndCleanUp(status.Value);
+
+                            // Set failed result makes the response task thrown an error. Must be called after
+                            // the response is finished. Reasons:
+                            // - Finishing the response sets the status. Required for GetStatus to be successful.
+                            // - We want GetStatus to always work when called after the response task is done.
+                            SetFailedResult(status.Value);
                         }
                         else
                         {
@@ -519,12 +498,9 @@ namespace Grpc.Net.Client.Internal
                             // Read entire response body immediately and read status from trailers
                             // Trailers are only available once the response body had been read
                             var responseStream = await HttpResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
-                            var message = await responseStream.ReadMessageAsync(
-                                Logger,
-                                Method.ResponseMarshaller.ContextualDeserializer,
+                            var message = await ReadMessageAsync(
+                                responseStream,
                                 GrpcProtocolHelpers.GetGrpcEncoding(HttpResponse),
-                                Channel.ReceiveMaxMessageSize,
-                                Channel.CompressionProviders,
                                 singleMessage: true,
                                 _callCts.Token).ConfigureAwait(false);
                             status = GrpcProtocolHelpers.GetResponseStatus(HttpResponse);
@@ -543,6 +519,10 @@ namespace Grpc.Net.Client.Internal
                                 FinishResponseAndCleanUp(status.Value);
                                 finished = FinishCall(request, diagnosticSourceEnabled, activity, status.Value);
 
+                                // Set failed result makes the response task thrown an error. Must be called after
+                                // the response is finished. Reasons:
+                                // - Finishing the response sets the status. Required for GetStatus to be successful.
+                                // - We want GetStatus to always work when called after the response task is done.
                                 SetFailedResult(status.Value);
                             }
                             else
@@ -558,6 +538,10 @@ namespace Grpc.Net.Client.Internal
                                 }
                                 else
                                 {
+                                    // Set failed result makes the response task thrown an error. Must be called after
+                                    // the response is finished. Reasons:
+                                    // - Finishing the response sets the status. Required for GetStatus to be successful.
+                                    // - We want GetStatus to always work when called after the response task is done.
                                     SetFailedResult(status.Value);
                                 }
                             }
@@ -580,7 +564,7 @@ namespace Grpc.Net.Client.Internal
                 catch (Exception ex)
                 {
                     Exception resolvedException;
-                    ResolveException(ex, out status, out resolvedException);
+                    ResolveException(ErrorStartingCallMessage, ex, out status, out resolvedException);
 
                     finished = FinishCall(request, diagnosticSourceEnabled, activity, status.Value);
                     _responseTcs?.TrySetException(resolvedException);
@@ -594,25 +578,49 @@ namespace Grpc.Net.Client.Internal
             }
         }
 
-        private void ResolveException(Exception ex, [NotNull] out Status? status, out Exception resolvedException)
+        /// <summary>
+        /// Resolve the specified exception to an end-user exception that will be thrown from the client.
+        /// The resolved exception is normally a RpcException. Returns true when the resolved exception is changed.
+        /// </summary>
+        internal bool ResolveException(string summary, Exception ex, [NotNull] out Status? status, out Exception resolvedException)
         {
             if (ex is OperationCanceledException)
             {
                 status = (CallTask.IsCompletedSuccessfully) ? CallTask.Result : new Status(StatusCode.Cancelled, string.Empty);
-                resolvedException = Channel.ThrowOperationCanceledOnCancellation ? ex : CreateRpcException(status.Value);
+                if (!Channel.ThrowOperationCanceledOnCancellation)
+                {
+                    resolvedException = CreateRpcException(status.Value);
+                    return true;
+                }
             }
             else if (ex is RpcException rpcException)
             {
                 status = rpcException.Status;
-                resolvedException = CreateRpcException(status.Value);
+                
+                // If trailers have been set, and the RpcException isn't using them, then
+                // create new RpcException with trailers. Want to try and avoid this as
+                // the exact stack location will be lost.
+                //
+                // Trailers could be set in another thread so copy to local variable.
+                var trailers = Trailers;
+                if (trailers != null && rpcException.Trailers != trailers)
+                {
+                    resolvedException = CreateRpcException(status.Value);
+                    return true;
+                }
             }
             else
             {
                 var exceptionMessage = CommonGrpcProtocolHelpers.ConvertToRpcExceptionMessage(ex);
+                var statusCode = GrpcProtocolHelpers.ResolveRpcExceptionStatusCode(ex);
 
-                status = new Status(StatusCode.Internal, "Error starting gRPC call. " +  exceptionMessage, ex);
+                status = new Status(statusCode, summary + " " + exceptionMessage, ex);
                 resolvedException = CreateRpcException(status.Value);
+                return true;
             }
+
+            resolvedException = ex;
+            return false;
         }
 
         private void SetFailedResult(Status status)
@@ -651,7 +659,7 @@ namespace Grpc.Net.Client.Internal
 
         private (bool diagnosticSourceEnabled, Activity? activity) InitializeCall(HttpRequestMessage request, TimeSpan? timeout)
         {
-            GrpcCallLog.StartingCall(Logger, Method.Type, request.RequestUri);
+            GrpcCallLog.StartingCall(Logger, Method.Type, request.RequestUri!);
             GrpcEventSource.Log.CallStart(Method.FullName);
 
             // Deadline will cancel the call CTS.
@@ -698,13 +706,7 @@ namespace Grpc.Net.Client.Internal
                 // The cancellation token will cancel the call CTS.
                 // This must be registered after the client writer has been created
                 // so that cancellation will always complete the writer.
-                _ctsRegistration = Options.CancellationToken.Register(() =>
-                {
-                    using (StartScope())
-                    {
-                        CancelCall(new Status(StatusCode.Cancelled, "Call canceled by the client."));
-                    }
-                });
+                _ctsRegistration = Options.CancellationToken.Register(CancelCallFromCancellationToken);
             }
 
             return (diagnosticSourceEnabled, activity);
@@ -776,7 +778,8 @@ namespace Grpc.Net.Client.Internal
 
         private void CreateWriter(HttpRequestMessage message)
         {
-            ClientStreamWriter = new HttpContentClientStreamWriter<TRequest, TResponse>(this, message);
+            RequestGrpcEncoding = GrpcProtocolHelpers.GetRequestEncoding(message.Headers);
+            ClientStreamWriter = new HttpContentClientStreamWriter<TRequest, TResponse>(this);
 
             message.Content = new PushStreamContent<TRequest, TResponse>(ClientStreamWriter, GrpcProtocolConstants.GrpcContentTypeHeaderValue);
         }
@@ -785,6 +788,9 @@ namespace Grpc.Net.Client.Internal
         {
             var message = new HttpRequestMessage(HttpMethod.Post, _grpcMethodInfo.CallUri);
             message.Version = HttpVersion.Version20;
+#if NET5_0
+            message.VersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
+#endif
 
             // Set raw headers on request using name/values. Typed headers allocate additional objects.
             var headers = message.Headers;
@@ -862,7 +868,7 @@ namespace Grpc.Net.Client.Internal
             return timeout;
         }
 
-        private void DeadlineExceededCallback(object state)
+        private void DeadlineExceededCallback(object? state)
         {
             // Deadline is only exceeded if the timeout has passed and
             // the response has not been finished or canceled
@@ -895,16 +901,12 @@ namespace Grpc.Net.Client.Internal
         internal ValueTask WriteMessageAsync(
             Stream stream,
             TRequest message,
-            string grpcEncoding,
             CallOptions callOptions)
         {
             return stream.WriteMessageAsync(
-                Logger,
+                this,
                 message,
                 Method.RequestMarshaller.ContextualSerializer,
-                grpcEncoding,
-                Channel.SendMaxMessageSize,
-                Channel.CompressionProviders,
                 callOptions);
         }
 
@@ -915,11 +917,9 @@ namespace Grpc.Net.Client.Internal
             CancellationToken cancellationToken)
         {
             return responseStream.ReadMessageAsync(
-                Logger,
+                this,
                 Method.ResponseMarshaller.ContextualDeserializer,
                 grpcEncoding,
-                Channel.ReceiveMaxMessageSize,
-                Channel.CompressionProviders,
                 singleMessage,
                 cancellationToken);
         }

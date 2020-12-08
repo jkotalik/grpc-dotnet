@@ -20,6 +20,7 @@ using System;
 using System.Buffers;
 using System.IO.Pipelines;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Grpc.AspNetCore.Web.Internal;
 using Grpc.Tests.Shared;
@@ -41,7 +42,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act
-            var result = await r.ReadAsync();
+            var result = await r.ReadAsync().AsTask().DefaultTimeout();
 
             // Assert
             Assert.Greater(result.Buffer.Length, 0);
@@ -60,7 +61,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act
-            var resultTask = r.ReadAsync();
+            var resultTask = r.ReadAsync().AsTask().DefaultTimeout();
 
             Assert.IsFalse(resultTask.IsCompleted);
 
@@ -75,6 +76,47 @@ namespace Grpc.AspNetCore.Server.Tests.Web
         }
 
         [Test]
+        public async Task ReadAsync_MultipleSuccesfulReadsAndWrites_Success()
+        {
+            // Arrange
+            var initialData = Encoding.UTF8.GetBytes("Hello world");
+            var base64Data = Encoding.UTF8.GetBytes(Convert.ToBase64String(initialData));
+            var testPipe = new Pipe();
+            var r = new Base64PipeReader(testPipe.Reader);
+
+            // Act 1
+            await testPipe.Writer.WriteAsync(base64Data.AsMemory(0, 5));
+            var result1 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 1
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hel"), result1.Buffer.ToArray());
+
+            // Act 2
+            r.AdvanceTo(result1.Buffer.Start, result1.Buffer.End);
+            await testPipe.Writer.WriteAsync(base64Data.AsMemory(5, 5));
+            var result2 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 2
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello "), result2.Buffer.ToArray());
+
+            // Act 3
+            r.AdvanceTo(result2.Buffer.Start, result2.Buffer.End);
+            await testPipe.Writer.WriteAsync(base64Data.AsMemory(10));
+            var result3 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 3
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello world"), result3.Buffer.ToArray());
+
+            // Act 4
+            r.AdvanceTo(result3.Buffer.End, result3.Buffer.End);
+            await testPipe.Writer.WriteAsync(base64Data);
+            var result4 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 4
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello world"), result4.Buffer.ToArray());
+        }
+
+        [Test]
         public async Task ReadAsync_ByteAtATime_Success()
         {
             // Arrange
@@ -84,7 +126,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act
-            var resultTask = r.ReadAsync();
+            var resultTask = r.ReadAsync().AsTask().DefaultTimeout();
 
             Assert.IsFalse(resultTask.IsCompleted);
 
@@ -101,9 +143,117 @@ namespace Grpc.AspNetCore.Server.Tests.Web
 
             r.AdvanceTo(result.Buffer.Start, result.Buffer.End);
 
-            result = await r.ReadAsync();
+            result = await r.ReadAsync().AsTask().DefaultTimeout();
 
             CollectionAssert.AreEqual(initialData, result.Buffer.ToArray());
+        }
+
+        private class OnAdvancePipeReader : PipeReader
+        {
+            private readonly Pipe _pipe;
+            private ReadOnlyMemory<byte> _data;
+            private bool _writeToPipe;
+
+            public OnAdvancePipeReader(Pipe pipe, byte[] data)
+            {
+                _pipe = pipe;
+                _data = data;
+                _writeToPipe = true;
+            }
+
+            public override void AdvanceTo(SequencePosition consumed)
+            {
+                _pipe.Reader.AdvanceTo(consumed);
+                _writeToPipe = true;
+            }
+
+            public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
+            {
+                _pipe.Reader.AdvanceTo(consumed, examined);
+                _writeToPipe = true;
+            }
+
+            public override void CancelPendingRead()
+            {
+                _pipe.Reader.CancelPendingRead();
+            }
+
+            public override void Complete(Exception? exception = null)
+            {
+                _pipe.Reader.Complete(exception);
+            }
+
+            public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+            {
+                // Write to the pipe when ReadAsync is called after Advance.
+                if (_writeToPipe)
+                {
+                    if (!_data.IsEmpty)
+                    {
+                        await _pipe.Writer.WriteAsync(_data.Slice(0, 1), cancellationToken);
+                        _data = _data.Slice(1);
+                    }
+                    else
+                    {
+                        _pipe.Writer.Complete();
+                    }
+
+                    _writeToPipe = false;
+                }
+
+                return await _pipe.Reader.ReadAsync(cancellationToken);
+            }
+
+            public override bool TryRead(out ReadResult result)
+            {
+                return _pipe.Reader.TryRead(out result);
+            }
+        }
+
+        [Test]
+        public async Task ReadAsync_ByteAtATimeOnAdvance_Success()
+        {
+            // Arrange
+            var initialData = Encoding.UTF8.GetBytes("Hello world");
+            var base64Data = Encoding.UTF8.GetBytes(Convert.ToBase64String(initialData));
+            var testPipe = new Pipe();
+            var onAdvancePipeReader = new OnAdvancePipeReader(testPipe, base64Data);
+            var r = new Base64PipeReader(onAdvancePipeReader);
+
+            // Act 1
+            var result1 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 1
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hel"), result1.Buffer.ToArray());
+
+            // Act 2
+            r.AdvanceTo(result1.Buffer.Start, result1.Buffer.End);
+            var result2 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 2
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello "), result2.Buffer.ToArray());
+
+            // Act 3
+            r.AdvanceTo(result2.Buffer.Start, result2.Buffer.End);
+            var result3 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 3
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello wor"), result3.Buffer.ToArray());
+
+            // Act 4
+            r.AdvanceTo(result3.Buffer.Start, result3.Buffer.End);
+            var result4 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 4
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("Hello world"), result4.Buffer.ToArray());
+            Assert.IsFalse(result4.IsCompleted);
+
+            // Act 4
+            r.AdvanceTo(result4.Buffer.End, result4.Buffer.End);
+            var result5 = await r.ReadAsync().AsTask().DefaultTimeout();
+
+            // Assert 4
+            Assert.IsTrue(result5.IsCompleted);
         }
 
         [TestCase("")]
@@ -194,7 +344,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act
-            var readTask = r.ReadAsync();
+            var readTask = r.ReadAsync().AsTask().DefaultTimeout();
 
             r.CancelPendingRead();
 
@@ -214,7 +364,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act
-            var readTask = r.ReadAsync();
+            var readTask = r.ReadAsync().AsTask().DefaultTimeout();
 
             r.CancelPendingRead();
 
@@ -234,11 +384,11 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             var r = new Base64PipeReader(testPipe.Reader);
 
             // Act 1
-            var readTask = r.ReadAsync();
+            var readTask = r.ReadAsync().AsTask().DefaultTimeout();
 
             r.CancelPendingRead();
 
-            var result = await readTask;
+            var result = await readTask.DefaultTimeout();
 
             // Assert 1
             Assert.IsTrue(result.IsCanceled);
@@ -246,7 +396,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
             // Act 2
             r.AdvanceTo(result.Buffer.Start, result.Buffer.End);
             await testPipe.Writer.WriteAsync(new byte[] { (byte)'A', (byte)'=', (byte)'=' }).AsTask().DefaultTimeout();
-            result = await r.ReadAsync();
+            result = await r.ReadAsync().AsTask().DefaultTimeout();
 
             // Assert 2
             CollectionAssert.AreEqual(Convert.FromBase64String("AA=="), result.Buffer.ToArray());
@@ -302,7 +452,7 @@ namespace Grpc.AspNetCore.Server.Tests.Web
                 readMessages++;
             }
 
-            var endResult = await r.ReadAsync();
+            var endResult = await r.ReadAsync().AsTask().DefaultTimeout();
             Assert.IsTrue(endResult.IsCompleted);
         }
     }

@@ -44,8 +44,17 @@ namespace Grpc.AspNetCore.Server.Internal.CallHandlers
             // Disable request body data rate for client streaming
             DisableMinRequestBodyDataRateAndMaxRequestBodySize(httpContext);
 
+            TResponse? response;
+
             var streamReader = new HttpContextStreamReader<TRequest>(serverCallContext, MethodInvoker.Method.RequestMarshaller.ContextualDeserializer);
-            var response = await _invoker.Invoke(httpContext, serverCallContext, streamReader);
+            try
+            {
+                response = await _invoker.Invoke(httpContext, serverCallContext, streamReader);
+            }
+            finally
+            {
+                streamReader.Complete();
+            }
 
             if (response == null)
             {
@@ -53,10 +62,11 @@ namespace Grpc.AspNetCore.Server.Internal.CallHandlers
                 throw new RpcException(new Status(StatusCode.Cancelled, "No message returned from method."));
             }
 
-            if (serverCallContext.DeadlineManager != null && serverCallContext.DeadlineManager.CallComplete)
+            // Check if deadline exceeded while method was invoked. If it has then skip trying to write
+            // the response message because it will always fail.
+            // Note that the call is still going so the deadline could still be exceeded after this point.
+            if (serverCallContext.DeadlineManager?.IsDeadlineExceededStarted ?? false)
             {
-                // The deadline has been exceeded and the call has been completed.
-                // There is no point trying to write to the response because it has been finished.
                 return;
             }
 

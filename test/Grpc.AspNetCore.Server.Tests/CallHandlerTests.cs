@@ -116,7 +116,7 @@ namespace Grpc.AspNetCore.Server.Tests
             // Assert
             var log = testSink.Writes.SingleOrDefault(w => w.EventId.Name == "UnsupportedRequestContentType");
             Assert.IsNotNull(log);
-            Assert.AreEqual("Request content-type of 'text/plain' is not supported.", log.Message);
+            Assert.AreEqual("Request content-type of 'text/plain' is not supported.", log!.Message);
         }
 
         [Test]
@@ -154,9 +154,11 @@ namespace Grpc.AspNetCore.Server.Tests
             // Assert
             var log = testSink.Writes.SingleOrDefault(w => w.EventId.Name == "UnsupportedRequestProtocol");
             Assert.IsNotNull(log);
-            Assert.AreEqual("Request protocol of 'HTTP/1.1' is not supported.", log.Message);
+            Assert.AreEqual("Request protocol of 'HTTP/1.1' is not supported.", log!.Message);
         }
 
+#if !NET5_0
+        // .NET Core 3.0 + IIS returned HTTP/2.0 as the protocol
         [Test]
         public async Task ProtocolValidation_IISHttp2Protocol_Success()
         {
@@ -174,6 +176,7 @@ namespace Grpc.AspNetCore.Server.Tests
             var log = testSink.Writes.SingleOrDefault(w => w.EventId.Name == "UnsupportedRequestProtocol");
             Assert.IsNull(log);
         }
+#endif
 
         [Test]
         public async Task StatusDebugException_ErrorInHandler_SetInDebugException()
@@ -191,10 +194,35 @@ namespace Grpc.AspNetCore.Server.Tests
             Assert.AreEqual(ex, serverCallContext.ServerCallContext.Status.DebugException);
         }
 
+        [Test]
+        public async Task Deadline_HandleCallAsyncWaitsForDeadlineToFinish()
+        {
+            // Arrange
+            Task? handleCallTask = null;
+            bool? isHandleCallTaskCompleteDuringDeadline = null;
+            var httpContext = HttpContextHelpers.CreateContext(completeAsyncAction: async () =>
+            {
+                await Task.Delay(200);
+                isHandleCallTaskCompleteDuringDeadline = handleCallTask?.IsCompleted;
+            });
+            httpContext.Request.Headers[GrpcProtocolConstants.TimeoutHeader] = "50m";
+            var call = CreateHandler(MethodType.ClientStreaming, handlerAction: () => Task.Delay(100));
+
+            // Act
+            handleCallTask = call.HandleCallAsync(httpContext).DefaultTimeout();
+            await handleCallTask;
+
+            // Assert
+            var serverCallContext = httpContext.Features.Get<IServerCallContextFeature>();
+            Assert.AreEqual(StatusCode.DeadlineExceeded, serverCallContext.ServerCallContext.Status.StatusCode);
+
+            Assert.IsFalse(isHandleCallTaskCompleteDuringDeadline);
+        }
+
         private static ServerCallHandlerBase<TestService, TestMessage, TestMessage> CreateHandler(
             MethodType methodType,
             ILoggerFactory? loggerFactory = null,
-            Action? handlerAction = null)
+            Func<Task>? handlerAction = null)
         {
             var method = new Method<TestMessage, TestMessage>(methodType, "test", "test", _marshaller, _marshaller);
 
@@ -203,10 +231,10 @@ namespace Grpc.AspNetCore.Server.Tests
                 case MethodType.Unary:
                     return new UnaryServerCallHandler<TestService, TestMessage, TestMessage>(
                         new UnaryServerMethodInvoker<TestService, TestMessage, TestMessage>(
-                            (service, reader, context) =>
+                            async (service, reader, context) =>
                             {
-                                handlerAction?.Invoke();
-                                return Task.FromResult(new TestMessage());
+                                await (handlerAction?.Invoke() ?? Task.CompletedTask);
+                                return new TestMessage();
                             },
                             method,
                             HttpContextServerCallContextHelper.CreateMethodOptions(),
@@ -215,10 +243,10 @@ namespace Grpc.AspNetCore.Server.Tests
                 case MethodType.ClientStreaming:
                     return new ClientStreamingServerCallHandler<TestService, TestMessage, TestMessage>(
                         new ClientStreamingServerMethodInvoker<TestService, TestMessage, TestMessage>(
-                            (service, reader, context) =>
+                            async (service, reader, context) =>
                             {
-                                handlerAction?.Invoke();
-                                return Task.FromResult(new TestMessage());
+                                await (handlerAction?.Invoke() ?? Task.CompletedTask);
+                                return new TestMessage();
                             },
                             method,
                             HttpContextServerCallContextHelper.CreateMethodOptions(),
@@ -227,10 +255,9 @@ namespace Grpc.AspNetCore.Server.Tests
                 case MethodType.ServerStreaming:
                     return new ServerStreamingServerCallHandler<TestService, TestMessage, TestMessage>(
                         new ServerStreamingServerMethodInvoker<TestService, TestMessage, TestMessage>(
-                            (service, request, writer, context) =>
+                            async (service, request, writer, context) =>
                             {
-                                handlerAction?.Invoke();
-                                return Task.FromResult(new TestMessage());
+                                await(handlerAction?.Invoke() ?? Task.CompletedTask);
                             },
                             method,
                             HttpContextServerCallContextHelper.CreateMethodOptions(),
@@ -239,10 +266,9 @@ namespace Grpc.AspNetCore.Server.Tests
                 case MethodType.DuplexStreaming:
                     return new DuplexStreamingServerCallHandler<TestService, TestMessage, TestMessage>(
                         new DuplexStreamingServerMethodInvoker<TestService, TestMessage, TestMessage>(
-                            (service, reader, writer, context) =>
+                            async (service, reader, writer, context) =>
                             {
-                                handlerAction?.Invoke();
-                                return Task.CompletedTask;
+                                await(handlerAction?.Invoke() ?? Task.CompletedTask);
                             },
                             method,
                             HttpContextServerCallContextHelper.CreateMethodOptions(),

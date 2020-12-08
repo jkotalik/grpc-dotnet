@@ -30,6 +30,7 @@ using Grpc.Core;
 using Grpc.Net.Client.Internal;
 using Grpc.Net.Client.Tests.Infrastructure;
 using Grpc.Net.Compression;
+using Grpc.Shared;
 using Grpc.Tests.Shared;
 using Microsoft.Extensions.Logging.Abstractions;
 using NUnit.Framework;
@@ -50,11 +51,10 @@ namespace Grpc.Net.Client.Tests
             {
                 httpRequestMessage = request;
 
-                var requestStream = await request.Content.ReadAsStreamAsync();
+                var requestStream = await request.Content!.ReadAsStreamAsync().DefaultTimeout();
 
-                helloRequest = await StreamExtensions.ReadMessageAsync(
+                helloRequest = await StreamSerializationHelper.ReadMessageAsync(
                     requestStream,
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -100,12 +100,11 @@ namespace Grpc.Net.Client.Tests
             {
                 httpRequestMessage = request;
 
-                var requestData = await request.Content.ReadAsByteArrayAsync();
+                var requestData = await request.Content!.ReadAsByteArrayAsync().DefaultTimeout();
                 isRequestNotCompressed = requestData[0] == 0;
 
-                helloRequest = await StreamExtensions.ReadMessageAsync(
+                helloRequest = await StreamSerializationHelper.ReadMessageAsync(
                     new MemoryStream(requestData),
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -168,11 +167,10 @@ namespace Grpc.Net.Client.Tests
             {
                 httpRequestMessage = request;
 
-                var requestStream = await request.Content.ReadAsStreamAsync();
+                var requestStream = await request.Content!.ReadAsStreamAsync().DefaultTimeout();
 
-                helloRequest = await StreamExtensions.ReadMessageAsync(
+                helloRequest = await StreamSerializationHelper.ReadMessageAsync(
                     requestStream,
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -215,11 +213,10 @@ namespace Grpc.Net.Client.Tests
             {
                 httpRequestMessage = request;
 
-                var requestStream = await request.Content.ReadAsStreamAsync();
+                var requestStream = await request.Content!.ReadAsStreamAsync().DefaultTimeout();
 
-                helloRequest = await StreamExtensions.ReadMessageAsync(
+                helloRequest = await StreamSerializationHelper.ReadMessageAsync(
                     requestStream,
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -258,20 +255,19 @@ namespace Grpc.Net.Client.Tests
             HttpRequestMessage? httpRequestMessage = null;
             HelloRequest? helloRequest1 = null;
             HelloRequest? helloRequest2 = null;
-            bool? isRequestNotCompressed1 = null;
-            bool? isRequestNotCompressed2 = null;
+            bool? isRequestCompressed1 = null;
+            bool? isRequestCompressed2 = null;
 
             var httpClient = ClientTestHelpers.CreateTestClient(async request =>
             {
                 httpRequestMessage = request;
 
-                var requestData = await request.Content.ReadAsByteArrayAsync();
+                var requestData = await request.Content!.ReadAsByteArrayAsync().DefaultTimeout();
                 var requestStream = new MemoryStream(requestData);
 
-                isRequestNotCompressed1 = requestData[0] == 0;
-                helloRequest1 = await StreamExtensions.ReadMessageAsync(
+                isRequestCompressed1 = requestData[0] == 1;
+                helloRequest1 = await StreamSerializationHelper.ReadMessageAsync(
                     requestStream,
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -279,10 +275,9 @@ namespace Grpc.Net.Client.Tests
                     singleMessage: false,
                     CancellationToken.None);
 
-                isRequestNotCompressed2 = requestData[requestStream.Position] == 0;
-                helloRequest2 = await StreamExtensions.ReadMessageAsync(
+                isRequestCompressed2 = requestData[requestStream.Position] == 1;
+                helloRequest2 = await StreamSerializationHelper.ReadMessageAsync(
                     requestStream,
-                    NullLogger.Instance,
                     ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                     "gzip",
                     maximumMessageSize: null,
@@ -322,7 +317,7 @@ namespace Grpc.Net.Client.Tests
                 Name = "Hello Two"
             }).DefaultTimeout();
 
-            await call.RequestStream.CompleteAsync();
+            await call.RequestStream.CompleteAsync().DefaultTimeout();
 
             // Assert
             var response = await call.ResponseAsync.DefaultTimeout();
@@ -339,8 +334,8 @@ namespace Grpc.Net.Client.Tests
             Debug.Assert(helloRequest2 != null);
             Assert.AreEqual("Hello Two", helloRequest2.Name);
 
-            Assert.IsFalse(isRequestNotCompressed1);
-            Assert.IsTrue(isRequestNotCompressed2);
+            Assert.IsTrue(isRequestCompressed1);
+            Assert.IsFalse(isRequestCompressed2);
         }
 
         private static Metadata CreateClientCompressionMetadata(string algorithmName)

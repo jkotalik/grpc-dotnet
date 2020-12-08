@@ -24,6 +24,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime;
 using System.Runtime.InteropServices;
@@ -46,6 +48,7 @@ namespace GrpcClient
         private static List<int> _requestsPerConnection = null!;
         private static List<int> _errorsPerConnection = null!;
         private static List<List<double>> _latencyPerConnection = null!;
+        private static int _callsStarted;
         private static double _maxLatency;
         private static Stopwatch _workTimer = new Stopwatch();
         private static volatile bool _warmingUp;
@@ -57,14 +60,17 @@ namespace GrpcClient
         private static ILoggerFactory? _loggerFactory;
         private static SslCredentials? _credentials;
         private static StringBuilder _errorStringBuilder = new StringBuilder();
+        private static CancellationTokenSource _cts = new CancellationTokenSource();
 
         public static async Task<int> Main(string[] args)
         {
             var rootCommand = new RootCommand();
             rootCommand.AddOption(new Option<string>(new string[] { "-u", "--url" }, "The server url to request") { Required = true });
+            rootCommand.AddOption(new Option<string>(new string[] { "--udsFileName" }, "The Unix Domain Socket file name"));
             rootCommand.AddOption(new Option<int>(new string[] { "-c", "--connections" }, () => 1, "Total number of connections to keep open"));
             rootCommand.AddOption(new Option<int>(new string[] { "-w", "--warmup" }, () => 5, "Duration of the warmup in seconds"));
             rootCommand.AddOption(new Option<int>(new string[] { "-d", "--duration" }, () => 10, "Duration of the test in seconds"));
+            rootCommand.AddOption(new Option<int>(new string[] { "--callCount" }, "Call count of test"));
             rootCommand.AddOption(new Option<string>(new string[] { "-s", "--scenario" }, "Scenario to run") { Required = true });
             rootCommand.AddOption(new Option<bool>(new string[] { "-l", "--latency" }, () => false, "Whether to collect detailed latency"));
             rootCommand.AddOption(new Option<string>(new string[] { "-p", "--protocol" }, "HTTP protocol") { Required = true });
@@ -74,6 +80,7 @@ namespace GrpcClient
             rootCommand.AddOption(new Option<GrpcClientType>(new string[] { "--grpcClientType" }, () => GrpcClientType.GrpcNetClient, "Whether to use Grpc.NetClient or Grpc.Core client"));
             rootCommand.AddOption(new Option<int>(new string[] { "--streams" }, () => 1, "Maximum concurrent streams per connection"));
             rootCommand.AddOption(new Option<bool>(new string[] { "--enableCertAuth" }, () => false, "Flag indicating whether client sends a client certificate"));
+            rootCommand.AddOption(new Option<int>(new string[] { "--deadline" }, "Duration of deadline in seconds"));
 
             rootCommand.Handler = CommandHandler.Create<ClientOptions>(async (options) =>
             {
@@ -109,17 +116,26 @@ namespace GrpcClient
 
         private static async Task StartScenario()
         {
-            var cts = new CancellationTokenSource();
-            cts.CancelAfter(TimeSpan.FromSeconds(_options.Duration + _options.Warmup));
-
-            _warmingUp = true;
-            _ = Task.Run(async () =>
+            if (_options.CallCount == null)
             {
-                await Task.Delay(TimeSpan.FromSeconds(_options.Warmup));
-                _workTimer.Restart();
-                _warmingUp = false;
-                Log("Finished warming up.");
-            });
+                Log("Warm up: " + _options.Warmup);
+                Log("Duration: " + _options.Duration);
+
+                _cts.CancelAfter(TimeSpan.FromSeconds(_options.Duration + _options.Warmup));
+
+                _warmingUp = true;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(_options.Warmup));
+                    _workTimer.Restart();
+                    _warmingUp = false;
+                    Log("Finished warming up.");
+                });
+            }
+            else
+            {
+                Log("Call count: " + _options.CallCount);
+            }
 
             var callTasks = new List<Task>();
 
@@ -131,13 +147,13 @@ namespace GrpcClient
                 switch (_options.Scenario?.ToLower())
                 {
                     case "unary":
-                        callFactory = (connectionId, streamId) => UnaryCall(cts, connectionId, streamId);
+                        callFactory = (connectionId, streamId) => UnaryCall(_cts, connectionId, streamId);
                         break;
                     case "serverstreaming":
-                        callFactory = (connectionId, streamId) => ServerStreamingCall(cts, connectionId, streamId);
+                        callFactory = (connectionId, streamId) => ServerStreamingCall(_cts, connectionId, streamId);
                         break;
                     case "pingpongstreaming":
-                        callFactory = (connectionId, streamId) => PingPongStreaming(cts, connectionId, streamId);
+                        callFactory = (connectionId, streamId) => PingPongStreaming(_cts, connectionId, streamId);
                         break;
                     default:
                         throw new Exception($"Scenario '{_options.Scenario}' is not a known scenario.");
@@ -217,7 +233,7 @@ namespace GrpcClient
             Log($"Least Requests per Connection: {min}");
             Log($"Most Requests per Connection: {max}");
 
-            if (_workTimer.ElapsedMilliseconds <= 0)
+            if (_options.CallCount == null && _workTimer.ElapsedMilliseconds <= 0)
             {
                 Log("Job failed to run");
                 return;
@@ -226,6 +242,7 @@ namespace GrpcClient
             var rps = (double)requestDelta / _workTimer.ElapsedMilliseconds * 1000;
             var errors = _errorsPerConnection.Sum();
             Log($"RPS: {rps:N0}");
+            Log($"Total requests: {requestDelta}");
             Log($"Total errors: {errors}");
 
             BenchmarksEventSource.Log.Metadata("grpc/rps/max", "max", "sum", "Max RPS", "RPS: max", "n0");
@@ -386,11 +403,10 @@ namespace GrpcClient
                     var address = useTls ? "https://" : "http://";
                     address += target;
 
-                    // This switch must be set before creating the GrpcChannel/HttpClient.
-                    // It allows HttpClient to make HTTP/2 calls without TLS.
+#if NETCOREAPP3_1
                     AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
-
-                    var httpClientHandler = new HttpClientHandler();
+#endif
+                    var httpClientHandler = new SocketsHttpHandler();
                     httpClientHandler.UseProxy = false;
                     httpClientHandler.AllowAutoRedirect = false;
                     if (_options.EnableCertAuth)
@@ -398,21 +414,35 @@ namespace GrpcClient
                         var basePath = Path.GetDirectoryName(typeof(Program).Assembly.Location);
                         var certPath = Path.Combine(basePath!, "Certs", "client.pfx");
                         var clientCertificate = new X509Certificate2(certPath, "1111");
-                        httpClientHandler.ClientCertificates.Add(clientCertificate);
+                        httpClientHandler.SslOptions.ClientCertificates = new X509CertificateCollection
+                        {
+                            clientCertificate
+                        };
                     }
+#if NET5_0 || NET6_0
+                    if (!string.IsNullOrEmpty(_options.UdsFileName))
+                    {
+                        var connectionFactory = new UnixDomainSocketConnectionFactory(new UnixDomainSocketEndPoint(ResolveUdsPath(_options.UdsFileName)));
+                        httpClientHandler.ConnectCallback = connectionFactory.ConnectAsync;
+                    }
+#endif
 
-                    // TODO(JamesNK): Check whether the disable can be removed once .NET 5 is finalized
-#pragma warning disable CS8619 // Nullability of reference types in value doesn't match target type.
-                    httpClientHandler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-#pragma warning restore CS8619 // Nullability of reference types in value doesn't match target type.
+                    httpClientHandler.SslOptions.RemoteCertificateValidationCallback =
+                        (object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors) => true;
 
                     return GrpcChannel.ForAddress(address, new GrpcChannelOptions
                     {
+#if NET5_0 || NET6_0
                         HttpHandler = httpClientHandler,
+#else
+                        HttpClient = new HttpClient(httpClientHandler),
+#endif
                         LoggerFactory = _loggerFactory
                     });
             }
         }
+
+        private static string ResolveUdsPath(string udsFileName) => Path.Combine(Path.GetTempPath(), udsFileName);
 
         private static SslCredentials GetSslCredentials()
         {
@@ -490,16 +520,32 @@ namespace GrpcClient
             }
         }
 
+        private static CallOptions CreateCallOptions()
+        {
+            var callOptions = new CallOptions();
+            if (_options.Deadline > 0)
+            {
+                callOptions = callOptions.WithDeadline(DateTime.UtcNow.AddSeconds(_options.Deadline));
+            }
+
+            return callOptions;
+        }
+
         private static async Task PingPongStreaming(CancellationTokenSource cts, int connectionId, int streamId)
         {
             Log(connectionId, streamId, $"Starting {_options.Scenario}");
 
             var client = new BenchmarkService.BenchmarkServiceClient(_channels[connectionId]);
             var request = CreateSimpleRequest();
-            using var call = client.StreamingCall();
+            using var call = client.StreamingCall(CreateCallOptions());
 
             while (!cts.IsCancellationRequested)
             {
+                if (StartCall())
+                {
+                    break;
+                }
+
                 try
                 {
                     var start = DateTime.UtcNow;
@@ -536,10 +582,17 @@ namespace GrpcClient
             Log(connectionId, streamId, $"Starting {_options.Scenario}");
 
             var client = new BenchmarkService.BenchmarkServiceClient(_channels[connectionId]);
-            using var call = client.StreamingFromServer(CreateSimpleRequest(), cancellationToken: cts.Token);
+            var callOptions = CreateCallOptions();
+            callOptions.WithCancellationToken(cts.Token);
+            using var call = client.StreamingFromServer(CreateSimpleRequest(), callOptions);
 
             while (!cts.IsCancellationRequested)
             {
+                if (StartCall())
+                {
+                    break;
+                }
+
                 try
                 {
                     var start = DateTime.UtcNow;
@@ -575,10 +628,15 @@ namespace GrpcClient
 
             while (!cts.IsCancellationRequested)
             {
+                if (StartCall())
+                {
+                    break;
+                }
+
                 try
                 {
                     var start = DateTime.UtcNow;
-                    var response = await client.UnaryCallAsync(CreateSimpleRequest());
+                    var response = await client.UnaryCallAsync(CreateSimpleRequest(), CreateCallOptions());
                     var end = DateTime.UtcNow;
 
                     ReceivedDateTime(start, end, connectionId);
@@ -592,6 +650,19 @@ namespace GrpcClient
             }
 
             Log(connectionId, streamId, $"Finished {_options.Scenario}");
+        }
+
+        private static bool StartCall()
+        {
+            Interlocked.Increment(ref _callsStarted);
+            if (_options.CallCount != null && _callsStarted > _options.CallCount)
+            {
+                Log($"Reached {_options.CallCount}");
+                _cts.Cancel();
+                return true;
+            }
+
+            return false;
         }
     }
 }

@@ -6,8 +6,13 @@
 
     <IsGrpcPublishedPackage>true</IsGrpcPublishedPackage>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <TargetFramework>netstandard2.1</TargetFramework>
+    <TargetFrameworks>netstandard2.1;net5.0</TargetFrameworks>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\HttpHandlerFactory.cs" Link="Internal\HttpHandlerFactory.cs" />
+    <Compile Include="..\Shared\TelemetryHeaderHandler.cs" Link="Internal\TelemetryHeaderHandler.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- PrivateAssets set to None to ensure the build targets/props are propagated to parent project -->

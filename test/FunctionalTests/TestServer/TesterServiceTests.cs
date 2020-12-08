@@ -91,20 +91,17 @@ namespace Grpc.AspNetCore.FunctionalTests.TestServer
             // Act
             using var call = client.SayHelloClientStreamingError();
 
-            var ex = await ExceptionAssert.ThrowsAsync<InvalidOperationException>(async () =>
+            var ex = await ExceptionAssert.ThrowsAsync<Exception>(async () =>
             {
-                var names = new[] { "James", "Jo", "Lee" };
-
+                while (true)
                 {
-                    foreach (var name in names)
-                    {
-                        await call.RequestStream.WriteAsync(new HelloRequest { Name = name }).DefaultTimeout();
-                        await Task.Delay(50);
-                    }
+                    await call.RequestStream.WriteAsync(new HelloRequest { Name = "Name!" }).DefaultTimeout();
+                    await Task.Delay(50);
                 }
             }).DefaultTimeout();
 
             // Assert
+            Assert.IsTrue(ex is InvalidOperationException || ex is RpcException);
             Assert.AreEqual(StatusCode.NotFound, call.GetStatus().StatusCode);
         }
 
@@ -150,9 +147,9 @@ namespace Grpc.AspNetCore.FunctionalTests.TestServer
             using var call = client.SayHelloServerStreamingError(new HelloRequest { Name = "Joe" });
 
             // Assert
-            Assert.IsTrue(await call.ResponseStream.MoveNext());
+            Assert.IsTrue(await call.ResponseStream.MoveNext().DefaultTimeout());
 
-            var ex = await ExceptionAssert.ThrowsAsync<RpcException>(() => call.ResponseStream.MoveNext());
+            var ex = await ExceptionAssert.ThrowsAsync<RpcException>(() => call.ResponseStream.MoveNext()).DefaultTimeout();
 
             Assert.AreEqual(StatusCode.NotFound, ex.StatusCode);
         }

@@ -119,21 +119,16 @@ namespace Grpc.Net.Client.Internal
 
         private async Task<bool> MoveNextCore(CancellationToken cancellationToken)
         {
-            CancellationTokenSource? cts = null;
+            CancellationTokenRegistration? ctsRegistration = null;
             try
             {
-                // Linking tokens is expensive. Only create a linked token if the token passed in requires it
                 if (cancellationToken.CanBeCanceled)
                 {
-                    cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _call.CancellationToken);
-                    cancellationToken = cts.Token;
-                }
-                else
-                {
-                    cancellationToken = _call.CancellationToken;
+                    // The cancellation token will cancel the call CTS.
+                    ctsRegistration = cancellationToken.Register(_call.CancelCallFromCancellationToken);
                 }
 
-                cancellationToken.ThrowIfCancellationRequested();
+                _call.CancellationToken.ThrowIfCancellationRequested();
 
                 if (_httpResponse == null)
                 {
@@ -167,7 +162,7 @@ namespace Grpc.Net.Client.Internal
                     _responseStream,
                     _grpcEncoding,
                     singleMessage: false,
-                    cancellationToken).ConfigureAwait(false);
+                    _call.CancellationToken).ConfigureAwait(false);
                 if (Current == null)
                 {
                     // No more content in response so report status to call.
@@ -200,9 +195,14 @@ namespace Grpc.Net.Client.Internal
 
                 throw _call.CreateCanceledStatusException();
             }
+            catch (Exception ex) when (_call.ResolveException("Error reading next message.", ex, out _, out var resolvedException))
+            {
+                // Throw RpcException from MoveNext. Consistent with Grpc.Core.
+                throw resolvedException;
+            }
             finally
             {
-                cts?.Dispose();
+                ctsRegistration?.Dispose();
             }
         }
 

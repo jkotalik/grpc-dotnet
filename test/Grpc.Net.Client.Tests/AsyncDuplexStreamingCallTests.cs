@@ -25,6 +25,7 @@ using Greet;
 using Grpc.Core;
 using Grpc.Net.Client.Internal;
 using Grpc.Net.Client.Tests.Infrastructure;
+using Grpc.Shared;
 using Grpc.Tests.Shared;
 using Microsoft.Extensions.Logging.Abstractions;
 using NUnit.Framework;
@@ -96,7 +97,7 @@ namespace Grpc.Net.Client.Tests
 
             var httpClient = ClientTestHelpers.CreateTestClient(async request =>
             {
-                content = (PushStreamContent<HelloRequest, HelloReply>)request.Content;
+                content = (PushStreamContent<HelloRequest, HelloReply>)request.Content!;
                 await content.PushComplete.DefaultTimeout();
 
                 return ResponseUtils.CreateResponse(HttpStatusCode.OK, new StreamContent(streamContent));
@@ -115,10 +116,12 @@ namespace Grpc.Net.Client.Tests
 
             await call.RequestStream.CompleteAsync().DefaultTimeout();
 
+            var deserializationContext = new DefaultDeserializationContext();
+
             Assert.IsNotNull(content);
             var requestContent = await content!.ReadAsStreamAsync().DefaultTimeout();
-            var requestMessage = await requestContent.ReadMessageAsync(
-                NullLogger.Instance,
+            var requestMessage = await StreamSerializationHelper.ReadMessageAsync(
+                requestContent,
                 ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                 GrpcProtocolConstants.IdentityGrpcEncoding,
                 maximumMessageSize: null,
@@ -126,8 +129,8 @@ namespace Grpc.Net.Client.Tests
                 singleMessage: false,
                 CancellationToken.None).AsTask().DefaultTimeout();
             Assert.AreEqual("1", requestMessage!.Name);
-            requestMessage = await requestContent.ReadMessageAsync(
-                NullLogger.Instance,
+            requestMessage = await StreamSerializationHelper.ReadMessageAsync(
+                requestContent,
                 ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                 GrpcProtocolConstants.IdentityGrpcEncoding,
                 maximumMessageSize: null,

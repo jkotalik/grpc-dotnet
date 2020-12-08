@@ -24,6 +24,7 @@ using Greet;
 using Grpc.Core;
 using Grpc.Net.Client.Internal;
 using Grpc.Net.Client.Tests.Infrastructure;
+using Grpc.Shared;
 using Grpc.Tests.Shared;
 using Microsoft.Extensions.Logging.Abstractions;
 using NUnit.Framework;
@@ -35,17 +36,16 @@ namespace Grpc.Net.Client.Tests
     {
         private async Task<HttpResponseMessage> HandleRequest(HttpRequestMessage request)
         {
-            var requestStream = await request.Content.ReadAsStreamAsync();
+            var requestStream = await request.Content!.ReadAsStreamAsync().DefaultTimeout();
 
-            var helloRequest = await StreamExtensions.ReadMessageAsync(
+            var helloRequest = await StreamSerializationHelper.ReadMessageAsync(
                 requestStream,
-                NullLogger.Instance,
                 ClientTestHelpers.ServiceMethod.RequestMarshaller.ContextualDeserializer,
                 "gzip",
                 maximumMessageSize: null,
                 GrpcProtocolConstants.DefaultCompressionProviders,
                 singleMessage: true,
-                CancellationToken.None);
+                CancellationToken.None).AsTask().DefaultTimeout();
 
             var reply = new HelloReply
             {
@@ -182,7 +182,7 @@ namespace Grpc.Net.Client.Tests
             {
                 Name = "World"
             });
-            await call.RequestStream.CompleteAsync();
+            await call.RequestStream.CompleteAsync().DefaultTimeout();
 
             // Assert
             await call.ResponseStream.MoveNext(CancellationToken.None).DefaultTimeout();
@@ -221,7 +221,7 @@ namespace Grpc.Net.Client.Tests
             {
                 Name = "World"
             });
-            await call.RequestStream.CompleteAsync();
+            await call.RequestStream.CompleteAsync().DefaultTimeout();
 
             // Assert
             await call.ResponseStream.MoveNext(CancellationToken.None).DefaultTimeout();
@@ -241,7 +241,7 @@ namespace Grpc.Net.Client.Tests
             {
                 Name = "World"
             });
-            await call.RequestStream.CompleteAsync();
+            await call.RequestStream.CompleteAsync().DefaultTimeout();
 
             // Assert
             var ex = await ExceptionAssert.ThrowsAsync<RpcException>(() => call.ResponseStream.MoveNext(CancellationToken.None));

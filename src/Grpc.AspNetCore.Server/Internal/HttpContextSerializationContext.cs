@@ -70,20 +70,11 @@ namespace Grpc.AspNetCore.Server.Internal
 
         private ICompressionProvider? ResolveCompressionProvider()
         {
-            Debug.Assert(
-                _serverCallContext.ResponseGrpcEncoding != null,
-                "Response encoding should have been calculated at this point.");
-
-            var canCompress =
+            if (_serverCallContext.ResponseGrpcEncoding != null &&
                 GrpcProtocolHelpers.CanWriteCompressed(_serverCallContext.WriteOptions) &&
-                !string.Equals(_serverCallContext.ResponseGrpcEncoding, GrpcProtocolConstants.IdentityGrpcEncoding, StringComparison.Ordinal);
-
-            if (canCompress)
+                _serverCallContext.Options.CompressionProviders.TryGetValue(_serverCallContext.ResponseGrpcEncoding, out var compressionProvider))
             {
-                if (_serverCallContext.Options.CompressionProviders.TryGetValue(_serverCallContext.ResponseGrpcEncoding, out var compressionProvider))
-                {
-                    return compressionProvider;
-                }
+                return compressionProvider;
             }
 
             return null;
@@ -191,7 +182,7 @@ namespace Grpc.AspNetCore.Server.Internal
 
                         var data = _bufferWriter.WrittenSpan;
 
-                        GrpcServerLog.SerializedMessage(_serverCallContext.Logger, typeof(object), data.Length);
+                        GrpcServerLog.SerializedMessage(_serverCallContext.Logger, _serverCallContext.ResponseType, data.Length);
                         WriteMessage(data);
                     }
                     else

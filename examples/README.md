@@ -6,22 +6,21 @@ If you are brand new to gRPC on .NET a good place to start is the getting starte
 
 ## [Greeter](./Greeter)
 
-The greeter shows how to create unary (non-streaming) and server streaming gRPC methods in ASP.NET Core, and call them from a client.
+The greeter shows how to create unary (non-streaming) gRPC methods in ASP.NET Core, and call them from a client.
 
 ##### Scenarios:
 
 * Unary call
-* Server streaming call
-* Client canceling a call
 
 ## [Counter](./Counter)
 
-The counter shows how to create unary (non-streaming) and client streaming gRPC methods in ASP.NET Core, and call them from a client.
+The counter shows how to create unary (non-streaming), client streaming and server streaming gRPC methods in ASP.NET Core, and call them from a client.
 
 ##### Scenarios:
 
 * Unary call
 * Client streaming call
+* Server streaming call
 
 ## [Mailer](./Mailer)
 
@@ -31,9 +30,9 @@ The mailer shows how to create a bi-directional streaming gRPC method in ASP.NET
 
 * Bi-directional streaming call
 
-## [Logger](./Logger)
+## [Interceptor](./Interceptor)
 
-The logger shows how to use interceptors on the client and server. The client interceptor adds additional metadata to each call and the server interceptor logs that metadata on the server.
+The interceptor shows how to use gRPC interceptors on the client and server. The client interceptor adds additional metadata to each call and the server interceptor logs that metadata on the server.
 
 ##### Scenarios:
 
@@ -228,3 +227,22 @@ This example uses [tye](https://github.com/dotnet/tye) to run the solution and f
 * Client factory
 * Mixing frontend RESTful API with backend gRPC services
 * App development with [Tye](https://github.com/dotnet/tye)
+
+## [Transporter](./Transporter)
+
+**Requirements:**
+* .NET 5 or later
+* Linux, MacOS or a [modern version of Windows](https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/)
+
+The transporter example shows how to use gRPC over non-TCP transports. This example uses a [Unix domain socket (UDS)](https://en.wikipedia.org/wiki/Unix_domain_socket) to send gRPC messages between the client and server.
+
+To use gRPC with UDS:
+
+1. The client creates a channel with a `ConnectCallback`. The callback connects to a specified UDS endpoint.
+2. The server configures a UDS endpoint with [KestrelServerOptions.ListenUnixSocket](https://docs.microsoft.com/dotnet/api/microsoft.aspnetcore.server.kestrel.core.kestrelserveroptions.listenunixsocket) in *Program.cs*.
+
+##### Scenarios:
+
+* Unix domain sockets
+* SocketsHttpHandler.ConnectCallback
+* [KestrelServerOptions.ListenUnixSocket](https://docs.microsoft.com/dotnet/api/microsoft.aspnetcore.server.kestrel.core.kestrelserveroptions.listenunixsocket)

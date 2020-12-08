@@ -175,12 +175,12 @@ namespace Grpc.AspNetCore.FunctionalTests.Server
 
             ReadResult readResult;
 
-            readResult = await pipeReader.ReadAsync();
+            readResult = await pipeReader.ReadAsync().AsTask().DefaultTimeout();
             Assert.AreEqual(1, readResult.Buffer.FirstSpan[0]); // Message is compressed
             var greeting1 = await MessageHelpers.AssertReadStreamMessageAsync<HelloReply>(pipeReader, "gzip").DefaultTimeout();
             Assert.AreEqual($"Hello 1", greeting1!.Message);
 
-            readResult = await pipeReader.ReadAsync();
+            readResult = await pipeReader.ReadAsync().AsTask().DefaultTimeout();
             Assert.AreEqual(0, readResult.Buffer.FirstSpan[0]); // Message is uncompressed
             var greeting2 = await MessageHelpers.AssertReadStreamMessageAsync<HelloReply>(pipeReader, "gzip").DefaultTimeout();
             Assert.AreEqual($"Hello 2", greeting2!.Message);
@@ -210,7 +210,7 @@ namespace Grpc.AspNetCore.FunctionalTests.Server
 
             // Assert
             Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
-            Assert.AreEqual("identity", response.Headers.GetValues(GrpcProtocolConstants.MessageEncodingHeader).Single());
+            Assert.IsFalse(response.Headers.Contains(GrpcProtocolConstants.MessageEncodingHeader));
 
             var responseMessage = MessageHelpers.AssertReadMessage<HelloReply>(await response.Content.ReadAsByteArrayAsync().DefaultTimeout());
             Assert.AreEqual("Hello World", responseMessage.Message);
@@ -490,7 +490,7 @@ namespace Grpc.AspNetCore.FunctionalTests.Server
 
             // Assert
             Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
-            Assert.AreEqual("identity", response.Headers.GetValues(GrpcProtocolConstants.MessageEncodingHeader).Single());
+            Assert.IsFalse(response.Headers.Contains(GrpcProtocolConstants.MessageEncodingHeader));
 
             var responseMessage = MessageHelpers.AssertReadMessage<HelloReply>(await response.Content.ReadAsByteArrayAsync().DefaultTimeout());
             Assert.AreEqual("Hello World", responseMessage.Message);
